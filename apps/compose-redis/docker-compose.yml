@@ -1,0 +1,13 @@
+# Two services: a web app that counts visits in redis. REDIS_HOST comes from
+# the action's app-env input through env_file.
+services:
+  web:
+    build:
+      context: .
+    env_file: .env
+    ports:
+      - "8090:8000"
+    depends_on:
+      - redis
+  redis:
+    image: redis:8-alpine

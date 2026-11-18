@@ -1,0 +1,252 @@
+# Tests shaban00/netbird-connect and shaban00/netbird-expose against a real
+# NetBird deployment.
+#
+# Secrets (Settings > Secrets and variables > Actions > Secrets):
+#   NETBIRD_SETUP_KEY       reusable, ephemeral setup key whose group may use
+#                           Peer Expose (Settings > Clients)
+#   NETBIRD_MANAGEMENT_URL  e.g. https://netbird.example.com
+#
+# Variables (same page, Variables tab), all optional:
+#   NETBIRD_CLIENT_REPOS    JSON list of repos to install the client from in
+#                           the connect job, e.g. ["netbirdio/netbird","owner/netbird"]
+#   NETBIRD_CLIENT_REPO     repo the expose jobs install the client from
+#   NETBIRD_WAIT_FOR_PEER   a peer the runner must reach, e.g. my-server
+#   NETBIRD_WAIT_FOR_HOST   host:port entries the runner must reach, e.g. my-server:22
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'   # weekly, to catch new client and server releases
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          URL: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+        run: |
+          if [ -n "$KEY" ] && [ -n "$URL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Set the NETBIRD_SETUP_KEY and NETBIRD_MANAGEMENT_URL secrets to run the tests."
+          fi
+
+  connect:
+    needs: config
+    if: needs.config.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(vars.NETBIRD_CLIENT_REPOS || '["netbirdio/netbird"]') }}
+    steps:
+      - name: NetBird Connect
+        id: nb
+        uses: shaban00/netbird-connect@v1.1.0
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+          repo: ${{ matrix.repo }}
+          hostname: gh-${{ github.run_id }}-connect-${{ strategy.job-index }}
+          wait-timeout: '90'
+          wait-for-peer: ${{ vars.NETBIRD_WAIT_FOR_PEER }}
+          wait-for-host: ${{ vars.NETBIRD_WAIT_FOR_HOST }}
+
+      - name: Check the outputs
+        env:
+          NB_IP: ${{ steps.nb.outputs.ip }}
+          NB_FQDN: ${{ steps.nb.outputs.fqdn }}
+        run: |
+          echo "ip=$NB_IP fqdn=$NB_FQDN"
+          [[ "$NB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::ip output is not an IPv4 address"; exit 1; }
+          [ -n "$NB_FQDN" ] || { echo "::error::fqdn output is empty"; exit 1; }
+
+      - name: Show the connection
+        run: |
+          netbird version
+          sudo netbird status -d
+
+      - name: Disconnect
+        if: always()
+        run: sudo netbird down || true
+
+  # One job per app, over HTTP(S). Each app has a test script in tests/.
+  expose:
+    needs: config
+    if: needs.config.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: static
+            dockerfile: apps/static/Dockerfile
+            port: '8080'
+            container-port: '80'
+            check-path: /health
+            test: static
+          - app: python-api
+            dockerfile: apps/python-api/Dockerfile
+            port: '5000'
+            check-path: /health
+            app-env: GREETING=hello-from-app-env
+            test: python-api
+          - app: websocket
+            dockerfile: apps/websocket/Dockerfile
+            port: '8080'
+            test: websocket
+          - app: slow-start
+            dockerfile: apps/slow-start/Dockerfile
+            port: '8000'
+            check-path: /health
+            check-timeout: '120'
+            test: slow-start
+          - app: https-backend
+            dockerfile: apps/https-backend/Dockerfile
+            port: '8443'
+            protocol: https
+            check-path: /health
+            test: https-backend
+          - app: compose-redis
+            docker-compose: apps/compose-redis/docker-compose.yml
+            port: '8090'
+            check-path: /health
+            app-env: REDIS_HOST=redis
+            test: compose-redis
+          - app: password
+            dockerfile: apps/static/Dockerfile
+            port: '8080'
+            container-port: '80'
+            auth: password
+            test: auth-required
+          - app: pin
+            dockerfile: apps/static/Dockerfile
+            port: '8080'
+            container-port: '80'
+            auth: pin
+            test: auth-required
+    name: expose (${{ matrix.app }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate one-time credentials
+        id: auth
+        if: matrix.auth != ''
+        env:
+          AUTH: ${{ matrix.auth }}
+        run: |
+          if [ "$AUTH" = pin ]; then
+            value="$(shuf -i 100000-999999 -n 1)"
+          else
+            value="$(openssl rand -hex 16)"
+          fi
+          echo "::add-mask::$value"
+          echo "$AUTH=$value" >> "$GITHUB_OUTPUT"
+
+      - name: NetBird Connect
+        uses: shaban00/netbird-connect@v1.1.0
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+          repo: ${{ vars.NETBIRD_CLIENT_REPO || 'netbirdio/netbird' }}
+          hostname: gh-${{ github.run_id }}-${{ matrix.app }}
+
+      - name: NetBird Expose
+        id: expose
+        uses: shaban00/netbird-expose@v1.1.1
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          docker-compose: ${{ matrix.docker-compose || 'docker-compose.yml' }}
+          port: ${{ matrix.port }}
+          container-port: ${{ matrix.container-port }}
+          protocol: ${{ matrix.protocol || 'http' }}
+          check-path: ${{ matrix.check-path || '/' }}
+          check-timeout: ${{ matrix.check-timeout || '60' }}
+          app-env: ${{ matrix.app-env }}
+          password: ${{ steps.auth.outputs.password }}
+          pin: ${{ steps.auth.outputs.pin }}
+          name-prefix: gh-${{ matrix.app }}
+          expose-duration: 15m
+          background: true
+
+      - name: Test the app through the proxy
+        env:
+          URL: ${{ steps.expose.outputs.url }}
+          EXPECTED_GREETING: hello-from-app-env
+        run: bash tests/${{ matrix.test }}.sh
+
+      - name: Disconnect
+        if: always()
+        run: sudo netbird down || true
+
+  # TCP and UDP services need their ports published on the proxy host and
+  # opened in its firewall. Opt in with NETBIRD_TEST_L4=true and set the ports.
+  expose-l4:
+    needs: config
+    if: needs.config.outputs.enabled == 'true' && vars.NETBIRD_TEST_L4 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: tcp-redis
+            protocol: tcp
+            port: '6379'
+            external-port: tcp
+            test: tcp-redis
+          - app: udp-dns
+            protocol: udp
+            port: '1053'
+            external-port: udp
+            test: udp-dns
+    name: expose (${{ matrix.app }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: NetBird Connect
+        uses: shaban00/netbird-connect@v1.1.0
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ secrets.NETBIRD_MANAGEMENT_URL }}
+          repo: ${{ vars.NETBIRD_CLIENT_REPO || 'netbirdio/netbird' }}
+          hostname: gh-${{ github.run_id }}-${{ matrix.app }}
+
+      - name: NetBird Expose
+        id: expose
+        uses: shaban00/netbird-expose@v1.1.1
+        with:
+          dockerfile: apps/${{ matrix.app }}/Dockerfile
+          port: ${{ matrix.port }}
+          protocol: ${{ matrix.protocol }}
+          external-port: ${{ matrix.external-port == 'tcp' && (vars.NETBIRD_L4_TCP_PORT || '16379') || (vars.NETBIRD_L4_UDP_PORT || '15353') }}
+          name-prefix: gh-${{ matrix.app }}
+          expose-duration: 15m
+          background: true
+
+      - name: Test the service through the proxy
+        env:
+          URL: ${{ steps.expose.outputs.url }}
+        run: bash tests/${{ matrix.test }}.sh
+
+      - name: Disconnect
+        if: always()
+        run: sudo netbird down || true

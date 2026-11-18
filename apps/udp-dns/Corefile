@@ -1,0 +1,7 @@
+.:1053 {
+    hosts {
+        192.0.2.10 netbird-expose.test
+        fallthrough
+    }
+    log
+}
