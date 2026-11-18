@@ -48,6 +48,9 @@ Settings > Secrets and variables > Actions.
 | `NETBIRD_TEST_L4`        | variable | no       | `true` to run the TCP and UDP tests       |
 | `NETBIRD_L4_TCP_PORT`    | variable | no       | `16379` (default)                         |
 | `NETBIRD_L4_UDP_PORT`    | variable | no       | `15353` (default)                         |
+| `NETBIRD_L4_CLUSTER`     | variable | no       | `proxy.example.com`: the cluster whose TCP/UDP ports are open |
+| `NETBIRD_HOLD_MINUTES`   | variable | no       | `60` (default): how long the connect jobs stay online |
+| `NETBIRD_SSH_RECORDER`   | variable | no       | NetBird IP of the SSH session recorder (fork client) |
 
 Without the two secrets the tests are skipped with a warning.
 
@@ -56,3 +59,6 @@ Without the two secrets the tests are skipped with a warning.
 The proxy listens on a separate port for each TCP or UDP service. Before setting
 `NETBIRD_TEST_L4=true`, publish both ports on the proxy host (its `docker-compose.yml`,
 e.g. `- '16379:16379'` and `- '15353:15353/udp'`) and open them in its firewall.
+
+With more than one proxy cluster, management places each exposed service on a random
+cluster. Set `NETBIRD_L4_CLUSTER` to the cluster whose ports you opened.

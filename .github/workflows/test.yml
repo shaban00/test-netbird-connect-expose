@@ -12,6 +12,11 @@
 #   NETBIRD_CLIENT_REPO     repo the expose jobs install the client from
 #   NETBIRD_WAIT_FOR_PEER   a peer the runner must reach, e.g. my-server
 #   NETBIRD_WAIT_FOR_HOST   host:port entries the runner must reach, e.g. my-server:22
+#   NETBIRD_HOLD_MINUTES    how long the connect jobs stay online (default 60)
+#   NETBIRD_SSH_RECORDER    NetBird IP of the SSH session recorder peer (fork client only)
+#   NETBIRD_L4_CLUSTER      proxy cluster for the TCP/UDP tests, whose ports are open,
+#                           e.g. proxy.example.com. Without it management picks a
+#                           cluster at random.
 name: Test
 
 on:
@@ -19,6 +24,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      hold-minutes:
+        description: 'Minutes the connect jobs stay online (max 80)'
+        required: false
+        default: '60'
   schedule:
     - cron: '17 6 * * 1'   # weekly, to catch new client and server releases
 
@@ -47,11 +57,13 @@ jobs:
             echo "::warning::Set the NETBIRD_SETUP_KEY and NETBIRD_MANAGEMENT_URL secrets to run the tests."
           fi
 
+  # Joins with SSH enabled and stays online (default 60 minutes) so you can
+  # reach the runner: netbird ssh, netbird drop, recorded SSH sessions.
   connect:
     needs: config
     if: needs.config.outputs.enabled == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +80,11 @@ jobs:
           wait-timeout: '90'
           wait-for-peer: ${{ vars.NETBIRD_WAIT_FOR_PEER }}
           wait-for-host: ${{ vars.NETBIRD_WAIT_FOR_HOST }}
+          allow-ssh: 'true'
+          # Birddrop and session recording exist only in the fork's client.
+          extra-args: >-
+            ${{ matrix.repo != 'netbirdio/netbird' && '--allow-birddrop' || '' }}
+            ${{ matrix.repo != 'netbirdio/netbird' && vars.NETBIRD_SSH_RECORDER && format('--ssh-session-recorder {0}', vars.NETBIRD_SSH_RECORDER) || '' }}
 
       - name: Check the outputs
         env:
@@ -82,6 +99,17 @@ jobs:
         run: |
           netbird version
           sudo netbird status -d
+
+      - name: Stay online
+        env:
+          HOLD: ${{ inputs.hold-minutes || vars.NETBIRD_HOLD_MINUTES || '60' }}
+          NB_FQDN: ${{ steps.nb.outputs.fqdn }}
+        run: |
+          [[ "$HOLD" =~ ^[0-9]+$ ]] && [ "$HOLD" -le 80 ] || { echo "::error::hold must be 0-80 minutes (got '$HOLD')"; exit 1; }
+          echo "Online as $NB_FQDN for $HOLD minutes. From a peer allowed by your policy:"
+          echo "  netbird ssh root@$NB_FQDN"
+          echo "  netbird drop send ${NB_FQDN%%.*} <file>     (fork client only)"
+          sleep "${HOLD}m"
 
       - name: Disconnect
         if: always()
@@ -237,6 +265,8 @@ jobs:
           dockerfile: apps/${{ matrix.app }}/Dockerfile
           port: ${{ matrix.port }}
           protocol: ${{ matrix.protocol }}
+          # A subdomain of a cluster pins the service to that cluster.
+          custom-domain: ${{ vars.NETBIRD_L4_CLUSTER && format('gh-{0}-{1}-{2}.{3}', matrix.app, github.run_id, github.run_attempt, vars.NETBIRD_L4_CLUSTER) || '' }}
           external-port: ${{ matrix.external-port == 'tcp' && (vars.NETBIRD_L4_TCP_PORT || '16379') || (vars.NETBIRD_L4_UDP_PORT || '15353') }}
           name-prefix: gh-${{ matrix.app }}
           expose-duration: 15m
