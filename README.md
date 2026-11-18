@@ -51,6 +51,9 @@ Settings > Secrets and variables > Actions.
 | `NETBIRD_L4_CLUSTER`     | variable | no       | `proxy.example.com`: the cluster whose TCP/UDP ports are open |
 | `NETBIRD_HOLD_MINUTES`   | variable | no       | `60` (default): how long the connect jobs stay online |
 | `NETBIRD_SSH_RECORDER`   | variable | no       | NetBird IP of the SSH session recorder (fork client) |
+| `NETBIRD_EXPOSE_HOLD_MINUTES` | variable | no  | `20` (default): how long each service stays up after its test |
+| `NETBIRD_TEST_PASSWORD`  | secret   | no       | password for the `password` app (random when unset) |
+| `NETBIRD_TEST_PIN`       | secret   | no       | 6-digit PIN for the `pin` app (random when unset) |
 
 Without the two secrets the tests are skipped with a warning.
 

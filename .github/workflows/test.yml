@@ -13,6 +13,11 @@
 #   NETBIRD_WAIT_FOR_PEER   a peer the runner must reach, e.g. my-server
 #   NETBIRD_WAIT_FOR_HOST   host:port entries the runner must reach, e.g. my-server:22
 #   NETBIRD_HOLD_MINUTES    how long the connect jobs stay online (default 60)
+#   NETBIRD_EXPOSE_HOLD_MINUTES  how long each exposed service stays up after its
+#                           test, for manual testing (default 20, max 40)
+#
+# Optional secrets for the password and PIN apps (random when unset):
+#   NETBIRD_TEST_PASSWORD, NETBIRD_TEST_PIN (6 digits)
 #   NETBIRD_SSH_RECORDER    NetBird IP of the SSH session recorder peer (fork client only)
 #   NETBIRD_L4_CLUSTER      proxy cluster for the TCP/UDP tests, whose ports are open,
 #                           e.g. proxy.example.com. Without it management picks a
@@ -29,6 +34,10 @@ on:
         description: 'Minutes the connect jobs stay online (max 80)'
         required: false
         default: '60'
+      expose-hold-minutes:
+        description: 'Minutes each exposed service stays up after its test (max 40)'
+        required: false
+        default: '20'
   schedule:
     - cron: '17 6 * * 1'   # weekly, to catch new client and server releases
 
@@ -120,7 +129,7 @@ jobs:
     needs: config
     if: needs.config.outputs.enabled == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -175,16 +184,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Generate one-time credentials
+      - name: Set the credentials
         id: auth
         if: matrix.auth != ''
         env:
           AUTH: ${{ matrix.auth }}
+          MY_PASSWORD: ${{ secrets.NETBIRD_TEST_PASSWORD }}
+          MY_PIN: ${{ secrets.NETBIRD_TEST_PIN }}
         run: |
+          # Your own secrets when set, so you can log in while the service is up.
           if [ "$AUTH" = pin ]; then
-            value="$(shuf -i 100000-999999 -n 1)"
+            value="${MY_PIN:-$(shuf -i 100000-999999 -n 1)}"
+            [[ "$value" =~ ^[0-9]{6}$ ]] || { echo "::error::NETBIRD_TEST_PIN must be 6 digits"; exit 1; }
           else
-            value="$(openssl rand -hex 16)"
+            value="${MY_PASSWORD:-$(openssl rand -hex 16)}"
           fi
           echo "::add-mask::$value"
           echo "$AUTH=$value" >> "$GITHUB_OUTPUT"
@@ -212,7 +225,7 @@ jobs:
           password: ${{ steps.auth.outputs.password }}
           pin: ${{ steps.auth.outputs.pin }}
           name-prefix: gh-${{ matrix.app }}
-          expose-duration: 15m
+          expose-duration: 45m
           background: true
 
       - name: Test the app through the proxy
@@ -220,6 +233,17 @@ jobs:
           URL: ${{ steps.expose.outputs.url }}
           EXPECTED_GREETING: hello-from-app-env
         run: bash tests/${{ matrix.test }}.sh
+
+      - name: Keep the service up for testing
+        if: always() && steps.expose.outcome == 'success'
+        env:
+          HOLD: ${{ inputs.expose-hold-minutes || vars.NETBIRD_EXPOSE_HOLD_MINUTES || '20' }}
+          APP: ${{ matrix.app }}
+        run: |
+          [[ "$HOLD" =~ ^[0-9]+$ ]] && [ "$HOLD" -le 40 ] || { echo "::error::expose hold must be 0-40 minutes (got '$HOLD')"; exit 1; }
+          echo "The service stays up for $HOLD minutes."
+          echo "Find its URL in the dashboard: Reverse Proxy > Services > gh-$APP-..."
+          sleep "${HOLD}m"
 
       - name: Disconnect
         if: always()
@@ -231,7 +255,7 @@ jobs:
     needs: config
     if: needs.config.outputs.enabled == 'true' && vars.NETBIRD_TEST_L4 == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -265,17 +289,29 @@ jobs:
           dockerfile: apps/${{ matrix.app }}/Dockerfile
           port: ${{ matrix.port }}
           protocol: ${{ matrix.protocol }}
-          # A subdomain of a cluster pins the service to that cluster.
-          custom-domain: ${{ vars.NETBIRD_L4_CLUSTER && format('gh-{0}-{1}-{2}.{3}', matrix.app, github.run_id, github.run_attempt, vars.NETBIRD_L4_CLUSTER) || '' }}
+          # Passing a cluster's domain pins the service to that cluster; the
+          # server names it <name>.<cluster>, one level under the wildcard DNS.
+          custom-domain: ${{ vars.NETBIRD_L4_CLUSTER }}
           external-port: ${{ matrix.external-port == 'tcp' && (vars.NETBIRD_L4_TCP_PORT || '16379') || (vars.NETBIRD_L4_UDP_PORT || '15353') }}
           name-prefix: gh-${{ matrix.app }}
-          expose-duration: 15m
+          expose-duration: 45m
           background: true
 
       - name: Test the service through the proxy
         env:
           URL: ${{ steps.expose.outputs.url }}
         run: bash tests/${{ matrix.test }}.sh
+
+      - name: Keep the service up for testing
+        if: always() && steps.expose.outcome == 'success'
+        env:
+          HOLD: ${{ inputs.expose-hold-minutes || vars.NETBIRD_EXPOSE_HOLD_MINUTES || '20' }}
+          APP: ${{ matrix.app }}
+        run: |
+          [[ "$HOLD" =~ ^[0-9]+$ ]] && [ "$HOLD" -le 40 ] || { echo "::error::expose hold must be 0-40 minutes (got '$HOLD')"; exit 1; }
+          echo "The service stays up for $HOLD minutes."
+          echo "Find its URL in the dashboard: Reverse Proxy > Services > gh-$APP-..."
+          sleep "${HOLD}m"
 
       - name: Disconnect
         if: always()
